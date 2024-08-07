@@ -14,13 +14,10 @@ from typing import Tuple
 import ops
 from charms.tls_certificates_interface.v3.tls_certificates import (
     TLSCertificatesProvidesV3,
-    generate_ca,
-    generate_certificate,
-    generate_csr,
-    generate_private_key,
     x509,
 )
 from gocert import GoCert
+from utils import generate_ca, generate_certificate, generate_csr, generate_private_key
 
 logger = logging.getLogger(__name__)
 
