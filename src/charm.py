@@ -13,8 +13,9 @@ from typing import Tuple
 
 import ops
 from charms.tls_certificates_interface.v4.tls_certificates import (
-    TLSCertificatesProvidesV4,
+    Certificate,
     ProviderCertificate,
+    TLSCertificatesProvidesV4,
     x509,
 )
 from gocert import GoCert
@@ -81,7 +82,7 @@ class GocertCharm(ops.CharmBase):
             for event in [
                 self.on["gocert"].pebble_ready,
                 self.on["gocert"].pebble_custom_notice,
-                self.tls.on.certificate_creation_request,
+                self.on["certificates"].relation_changed,
                 self.on.config_storage_attached,
                 self.on.database_storage_attached,
                 self.on.config_changed,
@@ -101,6 +102,7 @@ class GocertCharm(ops.CharmBase):
         self._configure_gocert_config_file()
         self._configure_access_certificates()
         self._configure_charm_authorization()
+        self._configure_certificate_requirers()
 
     def _on_collect_status(self, event: ops.CollectStatusEvent):
         if not self.unit.is_leader():
@@ -162,33 +164,39 @@ class GocertCharm(ops.CharmBase):
     def _configure_certificate_requirers(self):
         """Get all CSR's and certs from databags and Gocert, compare differences and update requirers if needed."""
         login_details = self._get_or_create_admin_account()
+        logger.warning(login_details)
         if not login_details.token:
+            logger.warning("couldn't distribute certificates: not logged in")
             return
 
         databag_csrs = self.tls.get_certificate_requests()
         gocert_csrs_table = self.client.get_certificate_requests_table(login_details.token)
         if not gocert_csrs_table:
+            logger.warning("couldn't distribute certificates: couldn't get table from GoCert")
             return
-
         for request in databag_csrs:
             matching_rows = list(
                 filter(
-                    lambda x: x.csr == request.certificate_signing_request, gocert_csrs_table.rows
+                    lambda x: x.csr == request.certificate_signing_request.raw,
+                    gocert_csrs_table.rows,
                 )
             )
             if len(matching_rows) < 1:
-                self.client.post_csr(request.csr, login_details.token)
+                self.client.post_csr(request.certificate_signing_request.raw, login_details.token)
                 continue
             matching_row = matching_rows[0]
             provided_certificates = self.tls.get_issued_certificates(request.relation_id)
             if matching_row.certificate != "" and matching_row.certificate not in [
                 obj.certificate.raw for obj in provided_certificates
             ]:
+                certificate = Certificate().from_string(matching_row.certificate)
                 self.tls.set_relation_certificate(
                     ProviderCertificate(
                         relation_id=request.relation_id,
-                        certificate_signing_request=matching_row.csr,
-                        certificate=matching_row.certificate,
+                        certificate_signing_request=request.certificate_signing_request,
+                        certificate=certificate,
+                        ca=Certificate(),
+                        chain=[certificate],
                     )
                 )
 

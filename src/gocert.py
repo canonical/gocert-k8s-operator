@@ -129,7 +129,7 @@ class GoCert:
     def get_certificate_requests_table(self, token: str) -> CertificateRequests | None:
         """Get all certificate requests table from GoCert."""
         try:
-            req = requests.post(
+            req = requests.get(
                 f"{self.url}/api/{self.API_VERSION}/certificate_requests",
                 verify=self.ca_path if self.ca_path else None,
                 headers={"Authorization": f"Bearer {token}"},
@@ -144,7 +144,12 @@ class GoCert:
             return None
         table = req.json()
         return CertificateRequests(
-            rows=[CertificateRequest(csr.id, csr.csr, csr.certificate) for csr in table]
+            rows=[
+                CertificateRequest(csr.get("id"), csr.get("csr"), csr.get("certificate"))
+                for csr in table
+            ]
+            if table
+            else []
         )
 
     def post_csr(self, csr: str, token: str) -> None:
