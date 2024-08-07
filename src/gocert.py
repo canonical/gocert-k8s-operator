@@ -4,6 +4,8 @@
 """Library for interacting with the GoCert application."""
 
 import logging
+from dataclasses import dataclass
+from typing import List
 
 import requests
 
@@ -12,6 +14,22 @@ logger = logging.getLogger(__name__)
 
 class GoCertClientError(Exception):
     """Base class for exceptions raised by the GoCert client."""
+
+
+@dataclass(frozen=True)
+class CertificateRequest:
+    """The certificate request that's stored in GoCert."""
+
+    id: int
+    csr: str
+    certificate: str
+
+
+@dataclass
+class CertificateRequests:
+    """The table of certificate requests in GoCert."""
+
+    rows: List[CertificateRequest]
 
 
 class GoCert:
@@ -107,3 +125,41 @@ class GoCert:
         logger.info("created the first user in GoCert.")
         id = req.json().get("id")
         return int(id) if id else None
+
+    def get_certificate_requests_table(self, token: str) -> CertificateRequests | None:
+        """Get all certificate requests table from GoCert."""
+        try:
+            req = requests.post(
+                f"{self.url}/api/{self.API_VERSION}/certificate_requests",
+                verify=self.ca_path if self.ca_path else None,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            req.raise_for_status()
+        except (requests.RequestException, OSError):
+            logger.warning(
+                "couldn't retrieve certificate requests table: code %s, %s",
+                req.status_code,
+                req.text,
+            )
+            return None
+        table = req.json()
+        return CertificateRequests(
+            rows=[CertificateRequest(csr.id, csr.csr, csr.certificate) for csr in table]
+        )
+
+    def post_csr(self, csr: str, token: str) -> None:
+        """Post a new CSR to GoCert."""
+        try:
+            req = requests.post(
+                f"{self.url}/api/{self.API_VERSION}/certificate_requests",
+                verify=self.ca_path if self.ca_path else None,
+                headers={"Authorization": f"Bearer {token}"},
+                data=csr,
+            )
+            req.raise_for_status()
+        except (requests.RequestException, OSError):
+            logger.error(
+                "couldn't post new certificate requests: code %s, %s",
+                req.status_code,
+                req.text,
+            )

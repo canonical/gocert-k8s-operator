@@ -161,6 +161,33 @@ class GocertCharm(ops.CharmBase):
             login_details_secret = self.model.get_secret(label=GOCERT_LOGIN_SECRET_LABEL)
             login_details_secret.set_content(login_details.to_dict())
 
+    def _configure_certificate_requirers(self):
+        """Get all CSR's and certs from databags and Gocert, compare differences and update requirers if needed."""
+        login_details = self._get_or_create_admin_account()
+        if not login_details.token:
+            return
+
+        databag_csrs = self.tls.get_requirer_csrs()
+        gocert_csrs_table = self.client.get_certificate_requests_table(login_details.token)
+        if not gocert_csrs_table:
+            return
+
+        for request in databag_csrs:
+            matching_row = list(filter(lambda x: x.csr == request.csr, gocert_csrs_table.rows))
+            if len(matching_row) < 1:
+                self.client.post_csr(request.csr, login_details.token)
+                continue
+            matching_row = matching_row[0]
+            provided_certificates = self.tls.get_provider_certificates(request.relation_id)
+            if matching_row.certificate not in [obj.certificate for obj in provided_certificates]:
+                self.tls.set_relation_certificate(
+                    certificate=matching_row.certificate,
+                    certificate_signing_request=matching_row.csr,
+                    ca="",  # TODO
+                    chain=[],  # TODO
+                    relation_id=request.relation_id,
+                )
+
     ## Properties ##
     @property
     def _pebble_layer(self) -> ops.pebble.LayerDict:
