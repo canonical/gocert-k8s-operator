@@ -12,8 +12,9 @@ from dataclasses import dataclass
 from typing import Tuple
 
 import ops
-from charms.tls_certificates_interface.v3.tls_certificates import (
-    TLSCertificatesProvidesV3,
+from charms.tls_certificates_interface.v4.tls_certificates import (
+    TLSCertificatesProvidesV4,
+    ProviderCertificate,
     x509,
 )
 from gocert import GoCert
@@ -69,7 +70,7 @@ class GocertCharm(ops.CharmBase):
         self.port = 2111
 
         self.container = self.unit.get_container("gocert")
-        self.tls = TLSCertificatesProvidesV3(self, relationship_name="certificates")
+        self.tls = TLSCertificatesProvidesV4(self, relationship_name="certificates")
         self.client = GoCert(
             f"https://{self._application_bind_address}:{self.port}",
             f"{CHARM_PATH}/{CONFIG_MOUNT}/0/ca.pem",
@@ -164,25 +165,31 @@ class GocertCharm(ops.CharmBase):
         if not login_details.token:
             return
 
-        databag_csrs = self.tls.get_requirer_csrs()
+        databag_csrs = self.tls.get_certificate_requests()
         gocert_csrs_table = self.client.get_certificate_requests_table(login_details.token)
         if not gocert_csrs_table:
             return
 
         for request in databag_csrs:
-            matching_row = list(filter(lambda x: x.csr == request.csr, gocert_csrs_table.rows))
-            if len(matching_row) < 1:
+            matching_rows = list(
+                filter(
+                    lambda x: x.csr == request.certificate_signing_request, gocert_csrs_table.rows
+                )
+            )
+            if len(matching_rows) < 1:
                 self.client.post_csr(request.csr, login_details.token)
                 continue
-            matching_row = matching_row[0]
-            provided_certificates = self.tls.get_provider_certificates(request.relation_id)
-            if matching_row.certificate not in [obj.certificate for obj in provided_certificates]:
+            matching_row = matching_rows[0]
+            provided_certificates = self.tls.get_issued_certificates(request.relation_id)
+            if matching_row.certificate != "" and matching_row.certificate not in [
+                obj.certificate.raw for obj in provided_certificates
+            ]:
                 self.tls.set_relation_certificate(
-                    certificate=matching_row.certificate,
-                    certificate_signing_request=matching_row.csr,
-                    ca="",  # TODO
-                    chain=[],  # TODO
-                    relation_id=request.relation_id,
+                    ProviderCertificate(
+                        relation_id=request.relation_id,
+                        certificate_signing_request=matching_row.csr,
+                        certificate=matching_row.certificate,
+                    )
                 )
 
     ## Properties ##
