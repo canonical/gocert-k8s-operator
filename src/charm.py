@@ -5,20 +5,21 @@
 """Charm the application."""
 
 import logging
+import random
+import string
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Tuple
 
 import ops
-from charms.tls_certificates_interface.v3.tls_certificates import (
-    TLSCertificatesProvidesV3,
-    generate_ca,
-    generate_certificate,
-    generate_csr,
-    generate_private_key,
+from charms.tls_certificates_interface.v4.tls_certificates import (
+    Certificate,
+    ProviderCertificate,
+    TLSCertificatesProvidesV4,
     x509,
 )
 from gocert import GoCert
+from utils import generate_ca, generate_certificate, generate_csr, generate_private_key
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ WORKLOAD_CONFIG_PATH = "/etc/gocert"
 
 SELF_SIGNED_CA_COMMON_NAME = "GoCert Self Signed Root CA"
 SELF_SIGNED_CA_SECRET_LABEL = "Self Signed Root CA"
+GOCERT_LOGIN_SECRET_LABEL = "GoCert Login Details"
 
 
 @dataclass
@@ -43,6 +45,23 @@ class CertificateSecret:
         return {"certificate": self.certificate, "private-key": self.private_key}
 
 
+@dataclass
+class LoginSecret:
+    """The format of the secret for the login details that are required to login to GoCert."""
+
+    username: str
+    password: str
+    token: str | None
+
+    def to_dict(self) -> dict[str, str]:
+        """Return a dict version of the secret."""
+        return {
+            "username": self.username,
+            "password": self.password,
+            "token": self.token if self.token else "",
+        }
+
+
 class GocertCharm(ops.CharmBase):
     """Charmed Gocert."""
 
@@ -52,8 +71,7 @@ class GocertCharm(ops.CharmBase):
         self.port = 2111
 
         self.container = self.unit.get_container("gocert")
-        self.tls = TLSCertificatesProvidesV3(self, relationship_name="certificates")
-
+        self.tls = TLSCertificatesProvidesV4(self, relationship_name="certificates")
         self.client = GoCert(
             f"https://{self._application_bind_address}:{self.port}",
             f"{CHARM_PATH}/{CONFIG_MOUNT}/0/ca.pem",
@@ -64,7 +82,7 @@ class GocertCharm(ops.CharmBase):
             for event in [
                 self.on["gocert"].pebble_ready,
                 self.on["gocert"].pebble_custom_notice,
-                self.tls.on.certificate_creation_request,
+                self.on["certificates"].relation_changed,
                 self.on.config_storage_attached,
                 self.on.database_storage_attached,
                 self.on.config_changed,
@@ -83,6 +101,8 @@ class GocertCharm(ops.CharmBase):
             return
         self._configure_gocert_config_file()
         self._configure_access_certificates()
+        self._configure_charm_authorization()
+        self._configure_certificate_requirers()
 
     def _on_collect_status(self, event: ops.CollectStatusEvent):
         if not self.unit.is_leader():
@@ -130,6 +150,55 @@ class GocertCharm(ops.CharmBase):
             self.container.add_layer("gocert", self._pebble_layer, combine=True)
             with suppress(ops.pebble.ChangeError):
                 self.container.replan()
+
+    def _configure_charm_authorization(self):
+        """Create an admin user to manage GoCert if needed, and acquire a token by logging in if needed."""
+        login_details = self._get_or_create_admin_account()
+        if not login_details:
+            return
+        if not login_details.token or not self.client.token_is_valid(login_details.token):
+            login_details.token = self.client.login(login_details.username, login_details.password)
+            login_details_secret = self.model.get_secret(label=GOCERT_LOGIN_SECRET_LABEL)
+            login_details_secret.set_content(login_details.to_dict())
+
+    def _configure_certificate_requirers(self):
+        """Get all CSR's and certs from databags and Gocert, compare differences and update requirers if needed."""
+        login_details = self._get_or_create_admin_account()
+        logger.warning(login_details)
+        if not login_details.token:
+            logger.warning("couldn't distribute certificates: not logged in")
+            return
+
+        databag_csrs = self.tls.get_certificate_requests()
+        gocert_csrs_table = self.client.get_certificate_requests_table(login_details.token)
+        if not gocert_csrs_table:
+            logger.warning("couldn't distribute certificates: couldn't get table from GoCert")
+            return
+        for request in databag_csrs:
+            matching_rows = list(
+                filter(
+                    lambda x: x.csr == request.certificate_signing_request.raw,
+                    gocert_csrs_table.rows,
+                )
+            )
+            if len(matching_rows) < 1:
+                self.client.post_csr(request.certificate_signing_request.raw, login_details.token)
+                continue
+            matching_row = matching_rows[0]
+            provided_certificates = self.tls.get_issued_certificates(request.relation_id)
+            if matching_row.certificate != "" and matching_row.certificate not in [
+                obj.certificate.raw for obj in provided_certificates
+            ]:
+                certificate = Certificate().from_string(matching_row.certificate)
+                self.tls.set_relation_certificate(
+                    ProviderCertificate(
+                        relation_id=request.relation_id,
+                        certificate_signing_request=request.certificate_signing_request,
+                        certificate=certificate,
+                        ca=Certificate(),
+                        chain=[certificate],
+                    )
+                )
 
     ## Properties ##
     @property
@@ -224,6 +293,53 @@ class GocertCharm(ops.CharmBase):
             content = CertificateSecret(certificate=ca.decode(), private_key=pk.decode())
             self.app.add_secret(label=SELF_SIGNED_CA_SECRET_LABEL, content=content.to_dict())
         return content.certificate.encode(), content.private_key.encode()
+
+    def _get_or_create_admin_account(self) -> LoginSecret | None:
+        """Get the first admin user for the charm to use from secrets. Create one if it doesn't exist.
+
+        Returns:
+            Login details secret if they exist. None if the related account couldn't be created in GoCert.
+        """
+        try:
+            secret = self.model.get_secret(label=GOCERT_LOGIN_SECRET_LABEL)
+            secret_content = secret.get_content(refresh=True)
+            username = secret_content.get("username", "")
+            password = secret_content.get("password", "")
+            token = secret_content.get("token")
+            account = LoginSecret(username, password, token)
+        except ops.SecretNotFoundError:
+            username = _generate_username()
+            password = _generate_password()
+            account = LoginSecret(username, password, None)
+            self.app.add_secret(
+                label=GOCERT_LOGIN_SECRET_LABEL,
+                content=account.to_dict(),
+            )
+            logger.info("admin account details saved to secrets.")
+        if self.client.is_api_available() and not self.client.is_initialized():
+            response = self.client.create_first_user(username, password)
+            if not response:
+                return None
+        return account
+
+
+def _generate_password() -> str:
+    """Generate a password for the GoCert Account."""
+    pw = []
+    pw.append(random.choice(string.ascii_lowercase))
+    pw.append(random.choice(string.ascii_uppercase))
+    pw.append(random.choice(string.digits))
+    pw.append(random.choice(string.punctuation))
+    for i in range(8):
+        pw.append(random.choice(string.ascii_letters + string.digits + string.punctuation))
+    random.shuffle(pw)
+    return "".join(pw)
+
+
+def _generate_username() -> str:
+    """Generate a username for the GoCert Account."""
+    suffix = [random.choice(string.ascii_uppercase) for i in range(4)]
+    return "charm-admin-" + "".join(suffix)
 
 
 if __name__ == "__main__":  # pragma: nocover
